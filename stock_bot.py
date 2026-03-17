@@ -136,7 +136,10 @@ def email_alert(cfg: dict, subject: str, html: str):
         msg["From"]    = cfg["email_sender"]
         msg["To"]      = cfg["email_recipient"]
         msg.attach(MIMEText(html, "html"))
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+        with smtplib.SMTP("smtp.gmail.com", 587) as s:
+            s.ehlo()
+            s.starttls()
+            s.ehlo()
             s.login(cfg["email_sender"], cfg["email_password"])
             s.sendmail(cfg["email_sender"], cfg["email_recipient"], msg.as_string())
     except Exception as e:
@@ -555,7 +558,10 @@ async def password_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         test_msg["Subject"] = "✅ Stock Tracker Email Connected!"
         test_msg["From"]    = email
         test_msg["To"]      = email
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+        with smtplib.SMTP("smtp.gmail.com", 587) as s:
+            s.ehlo()
+            s.starttls()
+            s.ehlo()
             s.login(email, password)
             s.sendmail(email, email, test_msg.as_string())
         await update.message.reply_text(
