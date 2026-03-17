@@ -131,17 +131,26 @@ def email_alert(cfg: dict, subject: str, html: str):
     if not cfg.get("email_enabled"):
         return
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"]    = cfg["email_sender"]
-        msg["To"]      = cfg["email_recipient"]
-        msg.attach(MIMEText(html, "html"))
-        with smtplib.SMTP("smtp.gmail.com", 587) as s:
-            s.ehlo()
-            s.starttls()
-            s.ehlo()
-            s.login(cfg["email_sender"], cfg["email_password"])
-            s.sendmail(cfg["email_sender"], cfg["email_recipient"], msg.as_string())
+        api_key   = cfg.get("resend_api_key")
+        recipient = cfg.get("email_recipient")
+        if not api_key or not recipient:
+            logger.warning("Email not configured. Run /setemail in Telegram.")
+            return
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "from":    "Stock Tracker <onboarding@resend.dev>",
+                "to":      [recipient],
+                "subject": subject,
+                "html":    html,
+            },
+            timeout=10,
+        )
+        if resp.status_code not in (200, 201):
+            logger.error("Resend API error: %s %s", resp.status_code, resp.text)
+        else:
+            logger.info("Email sent via Resend to %s", recipient)
     except Exception as e:
         logger.error("Email failed: %s", e)
 
@@ -514,13 +523,14 @@ async def email_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["pending_email"] = email
     await update.message.reply_text(
         "✅ Email saved!\n\n"
-        "Now I need your *Gmail App Password* to send emails.\n\n"
-        "📌 *How to get it:*\n"
-        "1. Go to myaccount.google.com\n"
-        "2. Security → 2-Step Verification → turn ON\n"
-        "3. Search *App Passwords*\n"
-        "4. Create one for \'Mail\'\n"
-        "5. Copy the 16-character password and send it here\n\n"
+        "Now I need your *Resend API Key* to send emails.\n\n"
+        "📌 *How to get it (free, 2 mins):*\n"
+        "1. Go to *resend.com* and sign up free\n"
+        "2. Click *API Keys* in the left menu\n"
+        "3. Click *Create API Key*\n"
+        "4. Copy the key (starts with `re_`)\n"
+        "5. Paste it here\n\n"
+        "✅ Free plan = 100 emails/day — more than enough!\n\n"
         "Send /cancel to stop.",
         parse_mode="Markdown"
     )
@@ -533,8 +543,7 @@ async def password_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     cfg = load_config()
     cfg["email_enabled"]   = True
-    cfg["email_sender"]    = email
-    cfg["email_password"]  = password
+    cfg["resend_api_key"]  = password
     cfg["email_recipient"] = email
     save_config(cfg)
 
@@ -544,39 +553,35 @@ async def password_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # Send test email
+    # Send test email via Resend
     try:
-        import smtplib
-        from email.mime.text import MIMEText
-        test_msg = MIMEText(
-            "<h2>✅ Email alerts are working!</h2>"
-            "<p>Your Stock Price Tracker will now send you:</p>"
-            "<ul><li>⚡ Instant alerts when your target price is hit</li>"
-            "<li>📊 Hourly price summary during market hours</li></ul>",
-            "html"
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {password}", "Content-Type": "application/json"},
+            json={
+                "from":    "Stock Tracker <onboarding@resend.dev>",
+                "to":      [email],
+                "subject": "✅ Stock Tracker Email Connected!",
+                "html":    "<h2>✅ Email alerts are working!</h2><p>You will now receive:</p><ul><li>⚡ Instant alerts when your target price is hit</li><li>📊 Hourly price summary during market hours</li></ul>",
+            },
+            timeout=10,
         )
-        test_msg["Subject"] = "✅ Stock Tracker Email Connected!"
-        test_msg["From"]    = email
-        test_msg["To"]      = email
-        with smtplib.SMTP("smtp.gmail.com", 587) as s:
-            s.ehlo()
-            s.starttls()
-            s.ehlo()
-            s.login(email, password)
-            s.sendmail(email, email, test_msg.as_string())
-        await update.message.reply_text(
-            "🎉 *Email alerts enabled!*\n\n"
-            f"📧 Sending to: `{email}`\n\n"
-            "A test email has been sent to confirm it\'s working.\n\n"
-            "You will now receive:\n"
-            "• ⚡ Instant email when target price is hit\n"
-            "• 📊 Hourly price summary (market hours only)",
-            parse_mode="Markdown"
-        )
+        if resp.status_code in (200, 201):
+            await update.message.reply_text(
+                "🎉 *Email alerts enabled!*\n\n"
+                f"📧 Sending to: `{email}`\n\n"
+                "A test email has been sent — check your inbox!\n\n"
+                "You will now receive:\n"
+                "• ⚡ Instant email when target price is hit\n"
+                "• 📊 Hourly price summary (market hours only)",
+                parse_mode="Markdown"
+            )
+        else:
+            raise Exception(f"API returned {resp.status_code}: {resp.text}")
     except Exception as e:
         await update.message.reply_text(
             f"⚠️ Could not send test email: {e}\n\n"
-            "Please check your App Password and try /setemail again."
+            "Please check your Resend API key and try /setemail again."
         )
         cfg["email_enabled"] = False
         save_config(cfg)
