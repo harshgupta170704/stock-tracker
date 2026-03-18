@@ -13,7 +13,6 @@ import logging
 import smtplib
 import schedule
 import threading
-import yfinance as yf
 from typing import Optional, Dict, Any
 from datetime import datetime, time as dtime
 import pytz
@@ -83,42 +82,65 @@ def groww_url(symbol: str) -> str:
     return f"https://groww.in/stocks/{clean.lower()}"
 
 def fetch_stock_price(symbol: str) -> Optional[Dict[str, Any]]:
-    yf_sym = to_yf_symbol(symbol)
+    """
+    Fetch NSE stock price using Stooq CSV API — reliable on Railway.
+    Stooq serves plain CSV over HTTPS, no API key needed.
+    NSE symbol format: tcs.ns, reliance.ns, hdfcbank.ns (lowercase + .ns)
+    """
+    clean   = symbol.upper().replace(".NS", "").replace(".BO", "")
+    stooq   = clean.lower() + ".ns"
+    url     = f"https://stooq.com/q/l/?s={stooq}&f=sd2t2ohlcv&h&e=csv"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; StockBot/1.0)"}
+
     try:
-        ticker = yf.Ticker(yf_sym)
-        info   = ticker.fast_info
-        price  = getattr(info, "last_price", None)
-        prev_close = getattr(info, "previous_close", None)
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        lines = resp.text.strip().splitlines()
 
-        company_name = symbol
-        try:
-            full_info    = ticker.info
-            company_name = full_info.get("longName") or full_info.get("shortName") or symbol
-        except Exception:
-            pass
-
-        if price is None or price == 0:
-            logger.warning("No price data for %s", yf_sym)
+        # CSV format: Symbol,Date,Time,Open,High,Low,Close,Volume
+        if len(lines) < 2:
+            logger.warning("No data from Stooq for %s", stooq)
             return None
 
-        change = None
-        change_pct = None
-        if prev_close and prev_close > 0:
-            change     = round(price - prev_close, 2)
-            change_pct = round(((price - prev_close) / prev_close) * 100, 2)
+        cols = lines[1].split(",")  # skip header row
+        if len(cols) < 7:
+            logger.warning("Unexpected Stooq format for %s: %s", stooq, lines[1])
+            return None
 
+        price = float(cols[6])  # Close price
+        if price <= 0:
+            logger.warning("Zero/invalid price for %s", stooq)
+            return None
+
+        # Get previous day close for % change (second data row if available)
+        prev_close = None
+        change     = None
+        change_pct = None
+        if len(lines) >= 3:
+            prev_cols = lines[2].split(",")
+            if len(prev_cols) >= 7:
+                try:
+                    prev_close = float(prev_cols[6])
+                    change     = round(price - prev_close, 2)
+                    change_pct = round(((price - prev_close) / prev_close) * 100, 2)
+                except ValueError:
+                    pass
+
+        logger.info("Fetched %s via Stooq: Rs %s (%s%%)", clean, price, change_pct)
         return {
-            "company_name": company_name,
-            "price":        round(float(price), 2),
+            "company_name": clean,
+            "price":        round(price, 2),
             "change":       change,
             "change_pct":   change_pct,
             "prev_close":   prev_close,
             "url":          groww_url(symbol),
             "fetched_at":   datetime.now(IST).isoformat(),
         }
+
     except Exception as e:
-        logger.error("Error fetching %s: %s", yf_sym, e)
+        logger.error("Stooq fetch failed for %s: %s", stooq, e)
         return None
+
 
 async def tg_alert(bot, chat_id: str, text: str, url: str = None):
     kwargs = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
