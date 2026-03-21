@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Stock Price Tracker — Telegram Bot
-Uses yfinance with history() method — reliable for NSE stocks
+Uses Alpha Vantage API for reliable NSE/BSE stock prices
+Works perfectly on Railway cloud
 """
 
 import os
@@ -11,12 +12,14 @@ import logging
 import schedule
 import threading
 import requests
-import yfinance as yf
 from typing import Optional, Dict, Any
 from datetime import datetime, time as dtime
 import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
+from telegram.ext import (
+    Application, CommandHandler, ContextTypes,
+    ConversationHandler, MessageHandler, filters
+)
 
 try:
     from plyer import notification as desktop_notify
@@ -24,6 +27,7 @@ try:
 except ImportError:
     DESKTOP_AVAILABLE = False
 
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
@@ -31,15 +35,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── Constants ─────────────────────────────────────────────────────────────────
 CONFIG_FILE         = "config.json"
 STOCKS_FILE         = "tracked_stocks.json"
 IST                 = pytz.timezone("Asia/Kolkata")
 MARKET_OPEN         = dtime(9, 15)
 MARKET_CLOSE        = dtime(15, 30)
-CHECK_INTERVAL_MINS = 15
+CHECK_INTERVAL_MINS = 120   # every 2 hours to stay within 25/day free limit
 DAILY_SUMMARY_TIME  = "15:35"
 AWAITING_EMAIL      = 1
 AWAITING_PASSWORD   = 2
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
     return json.load(open(CONFIG_FILE)) if os.path.exists(CONFIG_FILE) else {}
@@ -65,59 +72,84 @@ def now_ist_str() -> str:
 def groww_url(symbol: str) -> str:
     return f"https://groww.in/stocks/{symbol.lower()}"
 
-# ── Stock price fetcher ───────────────────────────────────────────────────────
+def to_av_symbol(symbol: str) -> str:
+    """Convert RELIANCE → BSE:RELIANCE for Alpha Vantage"""
+    clean = symbol.upper().strip().replace(".NS","").replace(".BO","").replace("BSE:","").replace("NSE:","")
+    return f"BSE:{clean}"
+
+# ── Alpha Vantage price fetcher ───────────────────────────────────────────────
 
 def fetch_stock_price(symbol: str) -> Optional[Dict[str, Any]]:
     """
-    Fetch NSE stock price using yfinance history() method.
-    history() is far more reliable than fast_info for Indian stocks.
+    Fetch stock price from Alpha Vantage API.
+    Uses GLOBAL_QUOTE endpoint — works for BSE/NSE stocks.
+    Free plan: 25 requests/day.
     """
-    clean  = symbol.upper().strip().replace(".NS", "").replace(".BO", "")
-    yf_sym = clean + ".NS"
+    cfg     = load_config()
+    api_key = cfg.get("alpha_vantage_key") or os.environ.get("ALPHA_VANTAGE_API_KEY")
+
+    if not api_key:
+        logger.error("No Alpha Vantage API key found.")
+        return None
+
+    clean     = symbol.upper().strip().replace(".NS","").replace(".BO","")
+    av_symbol = f"BSE:{clean}"
 
     try:
-        ticker = yf.Ticker(yf_sym)
+        resp = requests.get(
+            "https://www.alphavantage.co/query",
+            params={
+                "function": "GLOBAL_QUOTE",
+                "symbol":   av_symbol,
+                "apikey":   api_key,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data  = resp.json()
+        quote = data.get("Global Quote", {})
 
-        # Use history — most reliable method for NSE
-        hist = ticker.history(period="5d")
+        # Check if we got actual data
+        if not quote or not quote.get("05. price"):
+            # Try with NSE prefix as fallback
+            resp2 = requests.get(
+                "https://www.alphavantage.co/query",
+                params={
+                    "function": "GLOBAL_QUOTE",
+                    "symbol":   f"NSE:{clean}",
+                    "apikey":   api_key,
+                },
+                timeout=15,
+            )
+            resp2.raise_for_status()
+            data2  = resp2.json()
+            quote  = data2.get("Global Quote", {})
 
-        if hist.empty:
-            logger.warning("No history data for %s", yf_sym)
+        if not quote or not quote.get("05. price"):
+            logger.warning("No data for %s. Response: %s", av_symbol, data)
             return None
 
-        price      = float(hist["Close"].iloc[-1])
-        prev_close = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else None
+        price      = float(quote.get("05. price", 0))
+        prev_close = float(quote.get("08. previous close", 0))
+        change     = float(quote.get("09. change", 0))
+        change_pct = float(quote.get("10. change percent", "0%").replace("%",""))
 
         if price == 0:
             return None
 
-        # Get company name
-        company_name = clean
-        try:
-            info = ticker.fast_info
-            company_name = getattr(info, "long_name", clean) or clean
-        except Exception:
-            pass
-
-        change     = None
-        change_pct = None
-        if prev_close and prev_close > 0:
-            change     = round(price - prev_close, 2)
-            change_pct = round(((price - prev_close) / prev_close) * 100, 2)
-
-        logger.info("Fetched %s: ₹%s (%s%%)", yf_sym, price, change_pct)
+        logger.info("Alpha Vantage OK: %s = ₹%s (%s%%)", clean, price, change_pct)
         return {
-            "company_name": company_name,
+            "company_name": clean,
             "price":        round(price, 2),
-            "change":       change,
-            "change_pct":   change_pct,
-            "prev_close":   round(prev_close, 2) if prev_close else None,
+            "change":       round(change, 2),
+            "change_pct":   round(change_pct, 2),
+            "prev_close":   round(prev_close, 2),
             "url":          groww_url(clean),
             "fetched_at":   datetime.now(IST).isoformat(),
         }
 
     except Exception as e:
-        logger.error("fetch_stock_price failed for %s: %s", yf_sym, e)
+        logger.error("Alpha Vantage failed for %s: %s", clean, e)
         return None
 
 # ── Notifications ─────────────────────────────────────────────────────────────
@@ -125,7 +157,9 @@ def fetch_stock_price(symbol: str) -> Optional[Dict[str, Any]]:
 async def tg_alert(bot, chat_id: str, text: str, url: str = None):
     kwargs = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     if url:
-        kwargs["reply_markup"] = InlineKeyboardMarkup([[InlineKeyboardButton("📈 View on Groww", url=url)]])
+        kwargs["reply_markup"] = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📈 View on Groww", url=url)]]
+        )
     await bot.send_message(**kwargs)
 
 def email_alert(cfg: dict, subject: str, html: str):
@@ -139,7 +173,12 @@ def email_alert(cfg: dict, subject: str, html: str):
         requests.post(
             "https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"from": "Stock Tracker <onboarding@resend.dev>", "to": [recipient], "subject": subject, "html": html},
+            json={
+                "from":    "Stock Tracker <onboarding@resend.dev>",
+                "to":      [recipient],
+                "subject": subject,
+                "html":    html,
+            },
             timeout=10,
         )
     except Exception as e:
@@ -163,29 +202,37 @@ async def evaluate_alerts(bot, cfg: dict, symbol: str, stock: dict, info: dict):
     chat_id    = cfg.get("chat_id")
 
     if stock.get("target_low") and price <= stock["target_low"]:
-        msg = (f"🟢 *Buy Alert — Target Hit!*\n\n📊 *{name}* (`{symbol}`)\n"
-               f"💰 Current: *₹{price:,.2f}*\n🎯 Target: ₹{stock['target_low']:,.2f}\n🕐 {now_ist_str()}")
+        msg = (f"🟢 *Buy Alert — Target Hit!*\n\n"
+               f"📊 *{name}* (`{symbol}`)\n"
+               f"💰 Current: *₹{price:,.2f}*\n"
+               f"🎯 Your target: ₹{stock['target_low']:,.2f}\n"
+               f"🕐 {now_ist_str()}")
         if chat_id: await tg_alert(bot, chat_id, msg, url)
-        email_alert(cfg, f"🟢 Buy Alert: {name}", f"<p>{msg}</p>")
+        email_alert(cfg, f"🟢 Buy Alert: {name} hit ₹{price:,.2f}", f"<p>{msg.replace(chr(10),'<br>')}</p>")
         desktop_alert(f"Buy Alert: {name}", f"₹{price:,.2f}")
 
     if stock.get("target_high") and price >= stock["target_high"]:
-        msg = (f"🔴 *Sell Alert — Target Hit!*\n\n📊 *{name}* (`{symbol}`)\n"
-               f"💰 Current: *₹{price:,.2f}*\n🎯 Target: ₹{stock['target_high']:,.2f}\n🕐 {now_ist_str()}")
+        msg = (f"🔴 *Sell Alert — Target Hit!*\n\n"
+               f"📊 *{name}* (`{symbol}`)\n"
+               f"💰 Current: *₹{price:,.2f}*\n"
+               f"🎯 Your target: ₹{stock['target_high']:,.2f}\n"
+               f"🕐 {now_ist_str()}")
         if chat_id: await tg_alert(bot, chat_id, msg, url)
-        email_alert(cfg, f"🔴 Sell Alert: {name}", f"<p>{msg}</p>")
+        email_alert(cfg, f"🔴 Sell Alert: {name} hit ₹{price:,.2f}", f"<p>{msg.replace(chr(10),'<br>')}</p>")
         desktop_alert(f"Sell Alert: {name}", f"₹{price:,.2f}")
 
     alert_pct = stock.get("alert_pct_change")
     if alert_pct and change_pct is not None and abs(change_pct) >= abs(alert_pct):
         arrow = "📉" if change_pct < 0 else "📈"
-        msg   = (f"{arrow} *Big Move!*\n\n📊 *{name}* (`{symbol}`)\n"
-                 f"💰 ₹{price:,.2f}  {change_pct:+.2f}% today\n🕐 {now_ist_str()}")
+        msg   = (f"{arrow} *Big Move Alert!*\n\n"
+                 f"📊 *{name}* (`{symbol}`)\n"
+                 f"💰 ₹{price:,.2f}  {change_pct:+.2f}% today\n"
+                 f"🕐 {now_ist_str()}")
         if chat_id: await tg_alert(bot, chat_id, msg, url)
-        email_alert(cfg, f"{arrow} {name} moved {change_pct:+.2f}%", f"<p>{msg}</p>")
+        email_alert(cfg, f"{arrow} {name} moved {change_pct:+.2f}%", f"<p>{msg.replace(chr(10),'<br>')}</p>")
         desktop_alert(f"Big Move: {name}", f"{change_pct:+.2f}%")
 
-# ── Scheduler ─────────────────────────────────────────────────────────────────
+# ── Price check loop ──────────────────────────────────────────────────────────
 
 async def check_all_stocks(bot, cfg: dict):
     if not is_market_open():
@@ -194,6 +241,7 @@ async def check_all_stocks(bot, cfg: dict):
     stocks = load_stocks()
     if not stocks:
         return
+    logger.info("Checking %d stocks...", len(stocks))
     for symbol, stock in stocks.items():
         info = fetch_stock_price(symbol)
         if not info:
@@ -206,8 +254,9 @@ async def check_all_stocks(bot, cfg: dict):
         ph.append({"price": info["price"], "ts": info["fetched_at"]})
         stocks[symbol]["price_history"] = ph[-50:]
         await evaluate_alerts(bot, cfg, symbol, stock, info)
-        time.sleep(2)
+        time.sleep(15)  # small delay between stocks
     save_stocks(stocks)
+    logger.info("Stock check complete.")
 
 async def send_daily_summary(bot, cfg: dict):
     stocks  = load_stocks()
@@ -247,37 +296,44 @@ def send_hourly_email(cfg: dict):
         if s.get("target_high"): tgts += f"Sell: ₹{s['target_high']:,.0f}"
         bg = "#e8f5e9" if (s.get("target_low") and price <= s["target_low"]*1.02) else \
              "#fce4ec" if (s.get("target_high") and price >= s["target_high"]*0.98) else "#fff"
-        rows += (f"<tr style='background:{bg}'><td style='padding:8px'><b>{name}</b><br><small>{sym}</small></td>"
+        rows += (f"<tr style='background:{bg}'>"
+                 f"<td style='padding:8px'><b>{name}</b></td>"
                  f"<td style='padding:8px'><b>₹{price:,.2f}</b></td>"
                  f"<td style='padding:8px;color:{color}'>{pct_s}</td>"
-                 f"<td style='padding:8px;font-size:0.85em'>{tgts or '-'}</td></tr>")
+                 f"<td style='padding:8px;font-size:.85em'>{tgts or '-'}</td></tr>")
     html = (f"<html><body style='font-family:Arial,sans-serif;max-width:600px;margin:auto'>"
             f"<div style='background:#1a237e;color:#fff;padding:14px;border-radius:8px 8px 0 0'>"
-            f"<h2 style='margin:0'>📊 Hourly Stock Update</h2>"
+            f"<h2 style='margin:0'>📊 Stock Update</h2>"
             f"<p style='margin:4px 0 0;opacity:.8'>{now_ist_str()}</p></div>"
             f"<table width='100%' cellpadding='0' cellspacing='0' style='border:1px solid #ddd'>"
-            f"<tr style='background:#f5f5f5'><th style='padding:8px;text-align:left'>Stock</th>"
+            f"<tr style='background:#f5f5f5'>"
+            f"<th style='padding:8px;text-align:left'>Stock</th>"
             f"<th style='padding:8px;text-align:left'>Price</th>"
             f"<th style='padding:8px;text-align:left'>Change</th>"
             f"<th style='padding:8px;text-align:left'>Targets</th></tr>{rows}</table>"
-            f"<p style='color:#999;font-size:.8em;padding:8px'>🟢 Green = near buy | 🔴 Red = near sell</p>"
             f"</body></html>")
     email_alert(cfg, f"📊 Stock Update — {datetime.now(IST).strftime('%I:%M %p')}", html)
+
+# ── Scheduler ─────────────────────────────────────────────────────────────────
 
 def run_scheduler(bot, cfg: dict):
     import asyncio
     def _run():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        schedule.every(CHECK_INTERVAL_MINS).minutes.do(lambda: loop.run_until_complete(check_all_stocks(bot, cfg)))
-        schedule.every().day.at(DAILY_SUMMARY_TIME).do(lambda: loop.run_until_complete(send_daily_summary(bot, cfg)))
-        schedule.every(1).hours.do(lambda: send_hourly_email(cfg))
+        schedule.every(CHECK_INTERVAL_MINS).minutes.do(
+            lambda: loop.run_until_complete(check_all_stocks(bot, cfg))
+        )
+        schedule.every().day.at(DAILY_SUMMARY_TIME).do(
+            lambda: loop.run_until_complete(send_daily_summary(bot, cfg))
+        )
+        schedule.every(2).hours.do(lambda: send_hourly_email(cfg))
         while True:
             schedule.run_pending()
             time.sleep(30)
     threading.Thread(target=_run, daemon=True).start()
 
-# ── Handlers ──────────────────────────────────────────────────────────────────
+# ── Telegram handlers ─────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cfg = load_config()
@@ -285,55 +341,73 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save_config(cfg)
     await update.message.reply_text(
         "📈 *Welcome to Stock Price Tracker!*\n\n"
+        "I monitor BSE/NSE stocks via Alpha Vantage API.\n\n"
         "📋 *Commands:*\n"
-        "/track `RELIANCE` — Add stock\n"
-        "/setlow `RELIANCE 1400` — Buy alert\n"
-        "/sethigh `RELIANCE 1600` — Sell alert\n"
-        "/setpct `RELIANCE 5` — ±% move alert\n"
-        "/list — View watchlist\n"
-        "/remove `RELIANCE` — Remove stock\n"
+        "/track `RELIANCE` — Add stock to watchlist\n"
+        "/setlow `RELIANCE 1400` — Alert when price drops below\n"
+        "/sethigh `RELIANCE 1600` — Alert when price rises above\n"
+        "/setpct `RELIANCE 5` — Alert on ±5% day move\n"
+        "/list — View your watchlist\n"
+        "/remove `RELIANCE` — Remove from watchlist\n"
         "/check — Check prices now\n"
         "/summary — Today's summary\n"
         "/setemail — Set up email alerts\n"
         "/emailstatus — Email status\n"
         "/disableemail — Turn off email\n\n"
-        "💡 Examples: RELIANCE, TCS, INFY, HDFCBANK, WIPRO, SBIN",
+        "💡 Examples: RELIANCE, TCS, INFY, HDFCBANK, WIPRO, SBIN, ITC",
         parse_mode="Markdown",
     )
 
 async def cmd_track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
-        await update.message.reply_text("Usage: /track RELIANCE")
+        await update.message.reply_text("Usage: /track RELIANCE\nExamples: RELIANCE, TCS, INFY, HDFCBANK")
         return
-    symbol = ctx.args[0].upper().replace(".NS","").replace(".BO","").strip()
-    msg    = await update.message.reply_text(f"🔍 Fetching {symbol}...")
-    info   = fetch_stock_price(symbol)
-    if not info:
-        await msg.edit_text(
-            f"❌ Could not fetch *{symbol}*.\n\n"
-            "Possible reasons:\n"
-            "• Wrong symbol — try RELIANCE not Reliance Industries\n"
-            "• Market closed — try during 9:15 AM–3:30 PM IST\n"
-            "• Yahoo Finance temporarily down — try again in a minute\n\n"
-            "Examples: RELIANCE, TCS, INFY, HDFCBANK, WIPRO, SBIN, ITC",
+
+    cfg     = load_config()
+    api_key = cfg.get("alpha_vantage_key") or os.environ.get("ALPHA_VANTAGE_API_KEY")
+    if not api_key:
+        await update.message.reply_text(
+            "⚠️ *Alpha Vantage API key not set!*\n\n"
+            "Please add `ALPHA_VANTAGE_API_KEY` in Railway Variables.",
             parse_mode="Markdown"
         )
         return
+
+    symbol = ctx.args[0].upper().strip().replace(".NS","").replace(".BO","")
+    msg    = await update.message.reply_text(f"🔍 Fetching {symbol}...")
+    info   = fetch_stock_price(symbol)
+
+    if not info:
+        await msg.edit_text(
+            f"❌ Could not fetch *{symbol}*.\n\n"
+            "Make sure you're using the correct BSE symbol.\n"
+            "Examples: RELIANCE, TCS, INFY, WIPRO, HDFCBANK, SBIN, ITC\n\n"
+            "Note: Prices are fetched from BSE.",
+            parse_mode="Markdown"
+        )
+        return
+
     stocks = load_stocks()
     stocks[symbol] = {
-        "symbol": symbol, "company_name": info["company_name"],
-        "current_price": info["price"], "added_price": info["price"],
-        "target_low": None, "target_high": None, "alert_pct_change": None,
-        "added_at": datetime.now(IST).isoformat(), "last_checked": info["fetched_at"],
-        "change_pct": info.get("change_pct"),
-        "price_history": [{"price": info["price"], "ts": info["fetched_at"]}],
+        "symbol":           symbol,
+        "company_name":     info["company_name"],
+        "current_price":    info["price"],
+        "added_price":      info["price"],
+        "target_low":       None,
+        "target_high":      None,
+        "alert_pct_change": None,
+        "added_at":         datetime.now(IST).isoformat(),
+        "last_checked":     info["fetched_at"],
+        "change_pct":       info.get("change_pct"),
+        "price_history":    [{"price": info["price"], "ts": info["fetched_at"]}],
     }
     save_stocks(stocks)
+
     pct_str = f" ({info['change_pct']:+.2f}% today)" if info.get("change_pct") is not None else ""
     await msg.edit_text(
         f"✅ *Tracking {symbol}!*\n\n"
-        f"🏢 {info['company_name']}\n"
         f"💰 Price: *₹{info['price']:,.2f}*{pct_str}\n\n"
+        f"Set alerts:\n"
         f"• `/setlow {symbol} <price>` — buy alert\n"
         f"• `/sethigh {symbol} <price>` — sell alert\n"
         f"• `/setpct {symbol} 5` — 5% move alert",
@@ -349,11 +423,14 @@ async def cmd_setlow(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except: await update.message.reply_text("Invalid price."); return
     stocks = load_stocks()
     if symbol not in stocks:
-        await update.message.reply_text(f"Track {symbol} first with /track {symbol}")
+        await update.message.reply_text(f"Track {symbol} first: /track {symbol}")
         return
     stocks[symbol]["target_low"] = target
     save_stocks(stocks)
-    await update.message.reply_text(f"🟢 Alert set — will notify when {symbol} drops below *₹{target:,.2f}*", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"🟢 *Buy alert set!*\nAlert when *{symbol}* drops below *₹{target:,.2f}*",
+        parse_mode="Markdown"
+    )
 
 async def cmd_sethigh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(ctx.args) < 2:
@@ -364,11 +441,14 @@ async def cmd_sethigh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except: await update.message.reply_text("Invalid price."); return
     stocks = load_stocks()
     if symbol not in stocks:
-        await update.message.reply_text(f"Track {symbol} first with /track {symbol}")
+        await update.message.reply_text(f"Track {symbol} first: /track {symbol}")
         return
     stocks[symbol]["target_high"] = target
     save_stocks(stocks)
-    await update.message.reply_text(f"🔴 Alert set — will notify when {symbol} rises above *₹{target:,.2f}*", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"🔴 *Sell alert set!*\nAlert when *{symbol}* rises above *₹{target:,.2f}*",
+        parse_mode="Markdown"
+    )
 
 async def cmd_setpct(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(ctx.args) < 2:
@@ -379,11 +459,14 @@ async def cmd_setpct(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except: await update.message.reply_text("Invalid %."); return
     stocks = load_stocks()
     if symbol not in stocks:
-        await update.message.reply_text(f"Track {symbol} first with /track {symbol}")
+        await update.message.reply_text(f"Track {symbol} first: /track {symbol}")
         return
     stocks[symbol]["alert_pct_change"] = pct
     save_stocks(stocks)
-    await update.message.reply_text(f"⚡ Alert set — will notify when {symbol} moves *±{pct}%* in a day", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"⚡ *Move alert set!*\nAlert when *{symbol}* moves *±{pct}%* in a day",
+        parse_mode="Markdown"
+    )
 
 async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     stocks = load_stocks()
@@ -418,13 +501,13 @@ async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_market_open():
-        await update.message.reply_text("⚠️ Market closed. Fetching last known prices...")
+        await update.message.reply_text("⚠️ Market closed. Fetching last available prices...")
     msg    = await update.message.reply_text("🔄 Fetching prices...")
     stocks = load_stocks()
     if not stocks:
         await msg.edit_text("Watchlist empty. Use /track to add stocks.")
         return
-    lines = [f"📊 *Prices* — {now_ist_str()}\n"]
+    lines = [f"📊 *Live Prices* — {now_ist_str()}\n"]
     for symbol in stocks:
         info = fetch_stock_price(symbol)
         if info:
@@ -435,7 +518,7 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             stocks[symbol]["change_pct"]    = info.get("change_pct")
         else:
             lines.append(f"⚪ *{symbol}*: Could not fetch")
-        time.sleep(2)
+        time.sleep(15)
     save_stocks(stocks)
     await msg.edit_text("\n".join(lines), parse_mode="Markdown")
 
@@ -444,7 +527,7 @@ async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_setemail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📧 *Email Setup*\n\nSend me your Gmail address:\n\nExample: `yourname@gmail.com`\n\nSend /cancel to stop.",
+        "📧 *Email Setup*\n\nSend me your Gmail address:\nExample: `yourname@gmail.com`\n\n/cancel to stop.",
         parse_mode="Markdown"
     )
     return AWAITING_EMAIL
@@ -458,11 +541,11 @@ async def email_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["pending_email"] = email
     await update.message.reply_text(
         "✅ Got it!\n\nNow send your *Resend API Key*\n\n"
-        "📌 Get it free at *resend.com*:\n"
+        "📌 Get free at *resend.com*:\n"
         "1. Sign up → verify email\n"
         "2. Click API Keys → Create API Key\n"
         "3. Copy key (starts with `re_`) and paste here\n\n"
-        "Send /cancel to stop.",
+        "/cancel to stop.",
         parse_mode="Markdown"
     )
     return AWAITING_PASSWORD
@@ -483,9 +566,12 @@ async def password_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         resp = requests.post(
             "https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"from": "Stock Tracker <onboarding@resend.dev>", "to": [email],
-                  "subject": "✅ Stock Tracker Email Connected!",
-                  "html": "<h2>✅ Emails working!</h2><p>You'll get instant alerts when targets are hit and hourly summaries during market hours.</p>"},
+            json={
+                "from":    "Stock Tracker <onboarding@resend.dev>",
+                "to":      [email],
+                "subject": "✅ Stock Tracker Email Connected!",
+                "html":    "<h2>✅ Email alerts working!</h2><p>You will now receive instant alerts when your target price is hit.</p>",
+            },
             timeout=10,
         )
         if resp.status_code in (200, 201):
@@ -498,7 +584,7 @@ async def password_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         cfg["email_enabled"] = False
         save_config(cfg)
-        await update.message.reply_text(f"⚠️ Failed: {e}\n\nCheck your Resend key and try /setemail again.")
+        await update.message.reply_text(f"⚠️ Failed: {e}\n\nCheck Resend key and try /setemail again.")
     return ConversationHandler.END
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -508,7 +594,10 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_emailstatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cfg = load_config()
     if cfg.get("email_enabled") and cfg.get("email_recipient"):
-        await update.message.reply_text(f"📧 *Email ON* → `{cfg['email_recipient']}`\n\n/disableemail to turn off.", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"📧 *Email ON* → `{cfg['email_recipient']}`\n\n/disableemail to turn off.",
+            parse_mode="Markdown"
+        )
     else:
         await update.message.reply_text("📧 *Email OFF*\n\n/setemail to enable.", parse_mode="Markdown")
 
@@ -530,6 +619,12 @@ def main():
         print("No token. Add TELEGRAM_BOT_TOKEN to Railway Variables.")
         return
 
+    # Store Alpha Vantage key from env into config
+    av_key = os.environ.get("ALPHA_VANTAGE_API_KEY")
+    if av_key:
+        cfg["alpha_vantage_key"] = av_key
+        save_config(cfg)
+
     app = Application.builder().token(token).build()
 
     app.add_handler(ConversationHandler(
@@ -541,16 +636,27 @@ def main():
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     ))
 
-    for cmd, fn in [
-        ("start","cmd_start"),("track","cmd_track"),("setlow","cmd_setlow"),
-        ("sethigh","cmd_sethigh"),("setpct","cmd_setpct"),("list","cmd_list"),
-        ("remove","cmd_remove"),("check","cmd_check"),("summary","cmd_summary"),
-        ("emailstatus","cmd_emailstatus"),("disableemail","cmd_disableemail"),("help","cmd_help"),
+    for cmd, handler in [
+        ("start",        cmd_start),
+        ("track",        cmd_track),
+        ("setlow",       cmd_setlow),
+        ("sethigh",      cmd_sethigh),
+        ("setpct",       cmd_setpct),
+        ("list",         cmd_list),
+        ("remove",       cmd_remove),
+        ("check",        cmd_check),
+        ("summary",      cmd_summary),
+        ("emailstatus",  cmd_emailstatus),
+        ("disableemail", cmd_disableemail),
+        ("help",         cmd_help),
     ]:
-        app.add_handler(CommandHandler(cmd, eval(fn)))
+        app.add_handler(CommandHandler(cmd, handler))
 
     run_scheduler(app.bot, cfg)
-    print("📈 Stock Tracker running — yfinance history() method")
+
+    print("📈 Stock Tracker Bot running — Alpha Vantage API")
+    print(f"⏱  Checking every {CHECK_INTERVAL_MINS} mins during market hours")
+    print(f"📋 Daily summary at {DAILY_SUMMARY_TIME} IST")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
